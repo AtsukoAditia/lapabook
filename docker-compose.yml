@@ -1,0 +1,37 @@
+services:
+  postgres:
+    image: postgres:16
+    container_name: lapabook-postgres
+    restart: unless-stopped
+    environment:
+      POSTGRES_DB: lapabook
+      POSTGRES_USER: brodit
+      POSTGRES_PASSWORD: TYtB39f5FBO5UTJEiaFr6vj76MpS7llm
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+    # Keep internal only (no ports) - app accesses via docker network
+
+  app:
+    build: .
+    container_name: lapabook-app
+    restart: unless-stopped
+    depends_on:
+      - postgres
+    env_file:
+      - .env.local
+    environment:
+      # Override host for docker network (localhost inside container -> postgres service)
+      DATABASE_URL: postgresql://brodit:TYtB39f5FBO5UTJEiaFr6vj76MpS7llm@postgres:5432/lapabook
+      POSTGRES_URL: postgresql://brodit:TYtB39f5FBO5UTJEiaFr6vj76MpS7llm@postgres:5432/lapabook
+      IS_TESTING: "true"
+      DISABLE_RATE_LIMIT: "true"
+    ports:
+      - "3000:3000"
+    volumes:
+      - uploads_data:/app/uploads  # payment proofs — di luar public/, served via signed route; persist antar rebuild (sebelumnya hilang tiap rebuild!)
+
+volumes:
+  postgres_data:
+    external: true
+    name: lapangin-msr_postgres_data  # ponytail: reuse data lama; rename volume fisik butuh export/import, tidak worth it
+  uploads_data:

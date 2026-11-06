@@ -1,0 +1,11 @@
+node_modules
+.next
+.git
+graphify-out
+docs
+tests
+playwright-report
+*.log
+.env*
+
+/uploads/
