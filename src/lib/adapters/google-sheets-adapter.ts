@@ -1,0 +1,1104 @@
+import { GoogleSpreadsheet } from "google-spreadsheet";
+import { JWT } from "google-auth-library";
+import type {
+  DatabaseAdapter,
+  CreateBookingInput,
+  UpdateCourtInput,
+  CreatePricingRuleInput,
+  UpdatePricingRuleInput,
+  CreateBlockedSlotInput,
+  VoucherRow,
+} from "./database-adapter";
+import type {
+  Booking,
+  BlockedSlot,
+  Court,
+  PricingRule,
+  Sport,
+  Venue,
+  AuditLogEntry,
+  AuditLogAction,
+  PaymentMethod,
+  NotificationLog,
+  NotificationPayload,
+  AdminUser,
+  CustomerPublic,
+  Area,
+  Province,
+  City,
+  District,
+  Village,
+  RegionOption,
+  VenueOwner,
+  VenueOwnerStatus,
+  LoyaltyTransaction,
+  LoyaltyTransactionType,
+  Reward,
+  RewardRedemption,
+  CourtPhoto,
+  PickupGame,
+  PickupGameParticipant,
+  PickupGameMessage,
+  TeamWallet,
+  TeamWalletMember,
+  TeamWalletDeposit,
+  TeamWalletTransaction,
+  TeamWalletSplit,
+  TeamWalletSplitMember,
+  PlayerProfile,
+  PlayerSkillRating,
+  MatchRequest,
+  Achievement,
+  PlayerAchievement,
+  PlayerStreak,
+  FlashDeal,
+  VenueCamera,
+  VenueVerification,
+  VenueVerificationPhoto,
+  LoyaltyTier,
+  GroupBooking,
+  GroupBookingParticipant,
+  GroupBookingTimeSlot,
+  GroupBookingDetail,
+} from "@/lib/types/domain";
+
+function getJwtClient(): JWT {
+  const email = process.env.GOOGLE_SHEETS_CLIENT_EMAIL;
+  const key = process.env.GOOGLE_SHEETS_PRIVATE_KEY?.replace(/\\n/g, "\n");
+
+  if (!email || !key) {
+    throw new Error("Missing GOOGLE_SHEETS_CLIENT_EMAIL or GOOGLE_SHEETS_PRIVATE_KEY env vars");
+  }
+
+  return new JWT({
+    email,
+    key,
+    scopes: ["https://www.googleapis.com/auth/spreadsheets"],
+  });
+}
+
+async function getSpreadsheet(): Promise<GoogleSpreadsheet> {
+  const spreadsheetId = process.env.GOOGLE_SHEETS_SPREADSHEET_ID;
+  if (!spreadsheetId) {
+    throw new Error("Missing GOOGLE_SHEETS_SPREADSHEET_ID env var");
+  }
+
+  const jwtClient = getJwtClient();
+  const doc = new GoogleSpreadsheet(spreadsheetId, jwtClient);
+  await doc.loadInfo();
+  return doc;
+}
+
+// Helper to convert snake_case row to camelCase object
+function rowToSport(row: Record<string, unknown>): Sport {
+  return {
+    id: String(row.id ?? ""),
+    name: String(row.name ?? ""),
+    slug: String(row.slug ?? ""),
+    isActive: String(row.is_active).toLowerCase() === "true",
+  };
+}
+
+function rowToVenue(row: Record<string, unknown>): Venue {
+  return {
+    id: String(row.id ?? ""),
+    name: String(row.name ?? ""),
+    slug: String(row.slug ?? ""),
+    address: String(row.address ?? ""),
+    mapsUrl: String(row.maps_url ?? ""),
+    phone: String(row.phone ?? ""),
+    openTime: String(row.open_time ?? ""),
+    closeTime: String(row.close_time ?? ""),
+    isActive: String(row.is_active).toLowerCase() === "true",
+    approvalStatus: String(row.approval_status ?? "active") as Venue["approvalStatus"],
+    ownerId: row.owner_id ? String(row.owner_id) : undefined,
+    areaId: row.area_id ? String(row.area_id) : undefined,
+  };
+}
+
+function rowToCourt(row: Record<string, unknown>): Court {
+  return {
+    id: String(row.id ?? ""),
+    venueId: String(row.venue_id ?? ""),
+    sportId: String(row.sport_id ?? ""),
+    name: String(row.name ?? ""),
+    slug: String(row.slug ?? ""),
+    surfaceType: String(row.surface_type ?? ""),
+    indoorType: String(row.indoor_type ?? "") as Court["indoorType"],
+    capacity: Number(row.capacity ?? 0),
+    basePrice: Number(row.base_price ?? 0),
+    isActive: String(row.is_active).toLowerCase() === "true",
+  };
+}
+
+function rowToBooking(row: Record<string, unknown>): Booking {
+  return {
+    id: String(row.id ?? ""),
+    bookingCode: String(row.booking_code ?? ""),
+    customerName: String(row.customer_name ?? ""),
+    customerPhone: String(row.customer_phone ?? ""),
+    customerEmail: row.customer_email ? String(row.customer_email) : undefined,
+    venueId: String(row.venue_id ?? ""),
+    courtId: String(row.court_id ?? ""),
+    sportId: String(row.sport_id ?? ""),
+    bookingDate: String(row.booking_date ?? ""),
+    startTime: String(row.start_time ?? ""),
+    endTime: String(row.end_time ?? ""),
+    durationMinutes: Number(row.duration_minutes ?? 0),
+    totalPrice: Number(row.total_price ?? 0),
+    bookingStatus: String(row.booking_status ?? "pending") as Booking["bookingStatus"],
+    paymentStatus: String(row.payment_status ?? "unpaid") as Booking["paymentStatus"],
+    paymentProofUrl: row.payment_proof_url ? String(row.payment_proof_url) : undefined,
+    notes: row.notes ? String(row.notes) : undefined,
+    createdAt: String(row.created_at ?? ""),
+    updatedAt: String(row.updated_at ?? ""),
+  };
+}
+
+function rowToPricingRule(row: Record<string, unknown>): PricingRule {
+  return {
+    id: String(row.id ?? ""),
+    courtId: String(row.court_id ?? ""),
+    dayType: String(row.day_type ?? "all") as PricingRule["dayType"],
+    startTime: String(row.start_time ?? ""),
+    endTime: String(row.end_time ?? ""),
+    pricePerHour: Number(row.price_per_hour ?? 0),
+    priority: Number(row.priority ?? 0),
+    isActive: String(row.is_active).toLowerCase() === "true",
+  };
+}
+
+function rowToAuditLog(row: Record<string, unknown>): AuditLogEntry {
+  return {
+    id: String(row.id ?? ""),
+    timestamp: String(row.timestamp ?? ""),
+    action: String(row.action ?? "") as AuditLogAction,
+    targetType: String(row.target_type ?? "booking") as AuditLogEntry["targetType"],
+    targetId: String(row.target_id ?? ""),
+    actorType: String(row.actor_type ?? "system") as AuditLogEntry["actorType"],
+    actorId: row.actor_id ? String(row.actor_id) : undefined,
+    details: String(row.details ?? ""),
+    previousValue: row.previous_value ? String(row.previous_value) : undefined,
+    newValue: row.new_value ? String(row.new_value) : undefined,
+  };
+}
+
+function rowToBlockedSlot(row: Record<string, unknown>): BlockedSlot {
+  return {
+    id: String(row.id ?? ""),
+    courtId: String(row.court_id ?? ""),
+    date: String(row.date ?? ""),
+    startTime: String(row.start_time ?? ""),
+    endTime: String(row.end_time ?? ""),
+    reason: row.reason ? String(row.reason) : undefined,
+  };
+}
+
+export class GoogleSheetsAdapter implements DatabaseAdapter {
+  // ── Regions (stubs) ──
+  async getProvinces(): Promise<Province[]> { return []; }
+  async getCities(_provinceId: string): Promise<City[]> { return []; }
+  async getDistricts(_cityId: string): Promise<District[]> { return []; }
+  async getVillages(_districtId: string): Promise<Village[]> { return []; }
+  async getRegionOptions(): Promise<RegionOption[]> { return []; }
+  async getVenuesByDistrict(_districtId: string): Promise<Venue[]> { return []; }
+
+  async getSports(): Promise<Sport[]> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["sports"];
+    if (!sheet) return [];
+    const rows = await sheet.getRows();
+    return rows.map((row) => rowToSport(row.toObject())).filter((s) => s.isActive);
+  }
+  async getAllSports(): Promise<Sport[]> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["sports"];
+    if (!sheet) return [];
+    const rows = await sheet.getRows();
+    return rows.map((row) => rowToSport(row.toObject()));
+  }
+  async createSport(): Promise<Sport> { throw new Error("Not supported in Google Sheets mode"); }
+  async updateSport(): Promise<Sport> { throw new Error("Not supported in Google Sheets mode"); }
+  async deleteSport(): Promise<void> { throw new Error("Not supported in Google Sheets mode"); }
+
+  async getVenues(): Promise<Venue[]> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["venues"];
+    if (!sheet) return [];
+
+    const rows = await sheet.getRows();
+    return rows.map((row) => rowToVenue(row.toObject())).filter((v) => v.isActive && v.approvalStatus === "active");
+  }
+
+  async getVenuesByArea(areaId: string, sportId?: string): Promise<Venue[]> {
+    const venues = await this.getVenues();
+    let filtered = venues.filter((v) => v.areaId === areaId);
+    if (sportId) {
+      const courts = await this.getCourts();
+      const venueIds = new Set(courts.filter((c) => c.sportId === sportId).map((c) => c.venueId));
+      filtered = filtered.filter((v) => venueIds.has(v.id));
+    }
+    return filtered;
+  }
+
+  async getVenuesByOwner(ownerId: string): Promise<Venue[]> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["venues"];
+    if (!sheet) return [];
+
+    const rows = await sheet.getRows();
+    return rows
+      .map((row) => rowToVenue(row.toObject()))
+      .filter((v) => v.ownerId === ownerId);
+  }
+
+  async getVenueById(id: string): Promise<Venue | null> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["venues"];
+    if (!sheet) return null;
+
+    const rows = await sheet.getRows();
+    const found = rows
+      .map((row) => rowToVenue(row.toObject()))
+      .find((v) => v.id === id);
+    return found ?? null;
+  }
+
+  async getVenueBySlug(slug: string): Promise<Venue | null> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["venues"];
+    if (!sheet) return null;
+
+    const rows = await sheet.getRows();
+    const found = rows
+      .map((row) => rowToVenue(row.toObject()))
+      .find((v) => v.slug === slug);
+    return found ?? null;
+  }
+
+  async getCourts(): Promise<Court[]> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["courts"];
+    if (!sheet) return [];
+
+    const rows = await sheet.getRows();
+    return rows.map((row) => rowToCourt(row.toObject())).filter((c) => c.isActive);
+  }
+
+  async getCourtsByVenue(venueId: string): Promise<Court[]> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["courts"];
+    if (!sheet) return [];
+
+    const rows = await sheet.getRows();
+    return rows.map((row) => rowToCourt(row.toObject())).filter((c) => c.venueId === venueId);
+  }
+
+  async getHolidays(): Promise<never[]> {
+    return []; // Holidays come from DB in production
+  }
+
+  async getBookings(): Promise<Booking[]> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["bookings"];
+    if (!sheet) return [];
+
+    const rows = await sheet.getRows();
+    return rows.map((row) => rowToBooking(row.toObject()));
+  }
+
+  async getBookingsByCourtAndDate(courtId: string, date: string): Promise<Booking[]> {
+    const bookings = await this.getBookings();
+    const activeStatuses = ["waiting_payment", "waiting_verification", "paid", "confirmed", "pending"];
+    const now = new Date();
+    return bookings.filter(
+      (booking) =>
+        booking.courtId === courtId &&
+        booking.bookingDate === date &&
+        activeStatuses.includes(booking.bookingStatus) &&
+        !(booking.bookingStatus === "waiting_payment" && booking.expiresAt && new Date(booking.expiresAt) <= now),
+    );
+  }
+
+  async getBookingsByVenueIds(venueIds: string[]): Promise<Booking[]> {
+    const set = new Set(venueIds);
+    const bookings = await this.getBookings();
+    return bookings.filter((b) => set.has(b.venueId));
+  }
+
+  async getBookingByCode(code: string): Promise<Booking | null> {
+    // ponytail: sheets full-scan, add column index when perf matters
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["bookings"];
+    if (!sheet) return null;
+
+    const rows = await sheet.getRows();
+    const targetRow = rows.find((row) => row.get("booking_code") === code);
+    if (!targetRow) return null;
+
+    return rowToBooking(targetRow.toObject());
+  }
+
+  async updatePaymentProof(bookingId: string, proofUrl: string): Promise<Booking> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["bookings"];
+    if (!sheet) throw new Error("Bookings sheet not found");
+
+    const rows = await sheet.getRows();
+    const targetRow = rows.find((row) => row.get("id") === bookingId);
+    if (!targetRow) throw new Error("Booking not found");
+
+    const now = new Date().toISOString();
+    targetRow.set("payment_proof_url", proofUrl);
+    targetRow.set("booking_status", "waiting_verification");
+    targetRow.set("payment_status", "waiting_confirmation");
+    targetRow.set("updated_at", now);
+    await targetRow.save();
+
+    return rowToBooking(targetRow.toObject());
+  }
+
+  async expireBookings(): Promise<number> {
+    // ponytail: sheets full-scan + row-by-row update; batch when perf matters
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["bookings"];
+    if (!sheet) return 0;
+
+    const now = new Date().toISOString();
+    const rows = await sheet.getRows();
+    let count = 0;
+
+    for (const row of rows) {
+      const expiresAt = row.get("expires_at") as string | undefined;
+      const bookingStatus = row.get("booking_status") as string;
+
+      if (bookingStatus === "waiting_payment" && expiresAt && new Date(expiresAt).toISOString() < now) {
+        row.set("booking_status", "expired");
+        row.set("payment_status", "unpaid");
+        row.set("updated_at", now);
+        await row.save();
+        count++;
+      }
+    }
+
+    return count;
+  }
+
+  async createBooking(input: CreateBookingInput): Promise<Booking> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["bookings"];
+    if (!sheet) throw new Error("Bookings sheet not found");
+
+    const now = new Date().toISOString();
+    const bookingId = crypto.randomUUID();
+    const bookingCode = `AB-${Date.now().toString(36).toUpperCase()}`;
+    const expiresAt = new Date(Date.now() + 15 * 60 * 1000).toISOString();
+
+    const booking: Booking = {
+      id: bookingId,
+      bookingCode,
+      ...input,
+      bookingStatus: "waiting_payment",
+      paymentStatus: "unpaid",
+      expiresAt,
+      createdAt: now,
+      updatedAt: now,
+    };
+
+    await sheet.addRow({
+      id: booking.id,
+      booking_code: booking.bookingCode,
+      customer_name: booking.customerName,
+      customer_phone: booking.customerPhone,
+      customer_email: booking.customerEmail ?? "",
+      venue_id: booking.venueId,
+      court_id: booking.courtId,
+      sport_id: booking.sportId,
+      booking_date: booking.bookingDate,
+      start_time: booking.startTime,
+      end_time: booking.endTime,
+      duration_minutes: booking.durationMinutes,
+      total_price: booking.totalPrice,
+      booking_status: booking.bookingStatus,
+      payment_status: booking.paymentStatus,
+      payment_proof_url: booking.paymentProofUrl ?? "",
+      notes: booking.notes ?? "",
+      expires_at: booking.expiresAt ?? "",
+      created_at: booking.createdAt,
+      updated_at: booking.updatedAt,
+    });
+
+    return booking;
+  }
+
+  async updateBookingStatus(id: string, status: Booking["bookingStatus"]): Promise<Booking> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["bookings"];
+    if (!sheet) throw new Error("Bookings sheet not found");
+
+    const rows = await sheet.getRows();
+    const targetRow = rows.find((row) => row.get("id") === id);
+
+    if (!targetRow) {
+      throw new Error(`Booking with id ${id} not found`);
+    }
+
+    const now = new Date().toISOString();
+    targetRow.set("booking_status", status);
+    targetRow.set("updated_at", now);
+    await targetRow.save();
+
+    return rowToBooking(targetRow.toObject());
+  }
+
+  async updateBookingMidtransOrderId(_bookingId: string, _orderId: string): Promise<void> {}
+  async updateBookingMidtransTransactionId(_bookingId: string, _transactionId: string): Promise<void> {}
+  async updateBookingPaymentMethod(_bookingId: string, _method: "manual" | "midtrans"): Promise<void> {}
+
+  // ── Court Photos ──
+  async getCourtPhotos(_courtId: string): Promise<CourtPhoto[]> { return []; }
+  async createCourtPhoto(photo: CourtPhoto): Promise<CourtPhoto> { return photo; }
+  async deleteCourtPhoto(_id: string): Promise<void> {}
+
+  async getAllCourts(): Promise<Court[]> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["courts"];
+    if (!sheet) return [];
+
+    const rows = await sheet.getRows();
+    return rows.map((row) => rowToCourt(row.toObject()));
+  }
+
+  async getCourtById(id: string): Promise<Court | null> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["courts"];
+    if (!sheet) return null;
+
+    const rows = await sheet.getRows();
+    const row = rows.find((r) => r.get("id") === id);
+    return row ? rowToCourt(row.toObject()) : null;
+  }
+
+  async updateCourt(id: string, input: UpdateCourtInput): Promise<Court> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["courts"];
+    if (!sheet) throw new Error("Courts sheet not found");
+
+    const rows = await sheet.getRows();
+    const targetRow = rows.find((r) => r.get("id") === id);
+    if (!targetRow) throw new Error(`Court with id ${id} not found`);
+
+    if (input.name !== undefined) targetRow.set("name", input.name);
+    if (input.slug !== undefined) targetRow.set("slug", input.slug);
+    if (input.surfaceType !== undefined) targetRow.set("surface_type", input.surfaceType);
+    if (input.indoorType !== undefined) targetRow.set("indoor_type", input.indoorType);
+    if (input.capacity !== undefined) targetRow.set("capacity", input.capacity);
+    if (input.basePrice !== undefined) targetRow.set("base_price", input.basePrice);
+    if (input.isActive !== undefined) targetRow.set("is_active", String(input.isActive));
+
+    await targetRow.save();
+    return rowToCourt(targetRow.toObject());
+  }
+
+  async getBookingById(id: string): Promise<Booking | null> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["bookings"];
+    if (!sheet) return null;
+
+    const rows = await sheet.getRows();
+    const row = rows.find((r) => r.get("id") === id);
+    return row ? rowToBooking(row.toObject()) : null;
+  }
+
+  async getPricingRules(courtId: string): Promise<PricingRule[]> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["pricing_rules"];
+    if (!sheet) return [];
+
+    const rows = await sheet.getRows();
+    return rows
+      .map((row) => rowToPricingRule(row.toObject()))
+      .filter((rule) => rule.courtId === courtId && rule.isActive);
+  }
+
+  async getAllPricingRules(): Promise<PricingRule[]> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["pricing_rules"];
+    if (!sheet) return [];
+
+    const rows = await sheet.getRows();
+    return rows.map((row) => rowToPricingRule(row.toObject()));
+  }
+
+  async createPricingRule(input: CreatePricingRuleInput): Promise<PricingRule> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["pricing_rules"];
+    if (!sheet) throw new Error("Pricing rules sheet not found");
+
+    const rule: PricingRule = {
+      id: `pr-${crypto.randomUUID().slice(0, 8)}`,
+      ...input,
+      isActive: input.isActive ?? true,
+    };
+
+    await sheet.addRow({
+      id: rule.id,
+      court_id: rule.courtId,
+      day_type: rule.dayType,
+      start_time: rule.startTime,
+      end_time: rule.endTime,
+      price_per_hour: rule.pricePerHour,
+      priority: rule.priority,
+      is_active: String(rule.isActive),
+    });
+
+    return rule;
+  }
+
+  async updatePricingRule(id: string, input: UpdatePricingRuleInput): Promise<PricingRule> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["pricing_rules"];
+    if (!sheet) throw new Error("Pricing rules sheet not found");
+
+    const rows = await sheet.getRows();
+    const targetRow = rows.find((r) => r.get("id") === id);
+    if (!targetRow) throw new Error(`Pricing rule with id ${id} not found`);
+
+    if (input.dayType !== undefined) targetRow.set("day_type", input.dayType);
+    if (input.startTime !== undefined) targetRow.set("start_time", input.startTime);
+    if (input.endTime !== undefined) targetRow.set("end_time", input.endTime);
+    if (input.pricePerHour !== undefined) targetRow.set("price_per_hour", input.pricePerHour);
+    if (input.priority !== undefined) targetRow.set("priority", input.priority);
+    if (input.isActive !== undefined) targetRow.set("is_active", String(input.isActive));
+
+    await targetRow.save();
+    return rowToPricingRule(targetRow.toObject());
+  }
+
+  async deletePricingRule(id: string): Promise<void> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["pricing_rules"];
+    if (!sheet) throw new Error("Pricing rules sheet not found");
+
+    const rows = await sheet.getRows();
+    const targetRow = rows.find((r) => r.get("id") === id);
+    if (!targetRow) throw new Error(`Pricing rule with id ${id} not found`);
+
+    await targetRow.delete();
+  }
+
+  async getBlockedSlots(courtId: string, date: string): Promise<BlockedSlot[]> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["blocked_slots"];
+    if (!sheet) return [];
+
+    const rows = await sheet.getRows();
+    return rows
+      .map((row) => rowToBlockedSlot(row.toObject()))
+      .filter((slot) => slot.courtId === courtId && slot.date === date);
+  }
+
+  async getAllBlockedSlots(): Promise<BlockedSlot[]> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["blocked_slots"];
+    if (!sheet) return [];
+
+    const rows = await sheet.getRows();
+    return rows.map((row) => rowToBlockedSlot(row.toObject()));
+  }
+
+  async createBlockedSlot(input: CreateBlockedSlotInput): Promise<BlockedSlot> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["blocked_slots"];
+    if (!sheet) throw new Error("Blocked slots sheet not found");
+
+    const slot: BlockedSlot = {
+      id: `bs-${crypto.randomUUID().slice(0, 8)}`,
+      ...input,
+    };
+
+    await sheet.addRow({
+      id: slot.id,
+      court_id: slot.courtId,
+      date: slot.date,
+      start_time: slot.startTime,
+      end_time: slot.endTime,
+      reason: slot.reason ?? "",
+    });
+
+    return slot;
+  }
+
+  async deleteBlockedSlot(id: string): Promise<void> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["blocked_slots"];
+    if (!sheet) throw new Error("Blocked slots sheet not found");
+
+    const rows = await sheet.getRows();
+    const targetRow = rows.find((r) => r.get("id") === id);
+    if (!targetRow) throw new Error(`Blocked slot with id ${id} not found`);
+
+    await targetRow.delete();
+  }
+
+  // ── Audit Log ──
+  async getAuditLogs(targetId?: string): Promise<AuditLogEntry[]> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["audit_log"];
+    if (!sheet) return [];
+
+    const rows = await sheet.getRows();
+    let entries = rows.map((row) => rowToAuditLog(row.toObject()));
+    if (targetId) {
+      entries = entries.filter((e) => e.targetId === targetId);
+    }
+    return entries;
+  }
+
+  async createAuditLog(
+    entry: Omit<AuditLogEntry, "id" | "timestamp">,
+  ): Promise<AuditLogEntry> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["audit_log"];
+    if (!sheet) throw new Error("Audit log sheet not found");
+
+    const now = new Date().toISOString();
+    const logEntry: AuditLogEntry = {
+      id: `al-${crypto.randomUUID().slice(0, 8)}`,
+      timestamp: now,
+      ...entry,
+    };
+
+    await sheet.addRow({
+      id: logEntry.id,
+      timestamp: logEntry.timestamp,
+      action: logEntry.action,
+      target_type: logEntry.targetType,
+      target_id: logEntry.targetId,
+      actor_type: logEntry.actorType,
+      actor_id: logEntry.actorId ?? "",
+      details: logEntry.details,
+      previous_value: logEntry.previousValue ?? "",
+      new_value: logEntry.newValue ?? "",
+    });
+
+    return logEntry;
+  }
+
+  // ── Payment Methods ──
+  async getPaymentMethods(): Promise<PaymentMethod[]> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["payment_methods"];
+    if (!sheet) return [];
+
+    const rows = await sheet.getRows();
+    return rows.map((row) => {
+      const obj = row.toObject();
+      return {
+        id: String(obj.id ?? ""),
+        name: String(obj.name ?? ""),
+        label: String(obj.label ?? obj.name ?? ""),
+        type: String(obj.type ?? "bank_transfer") as PaymentMethod["type"],
+        accountName: String(obj.account_name ?? ""),
+        accountNumber: obj.account_number ? String(obj.account_number) : undefined,
+        provider: String(obj.provider ?? ""),
+        details: String(obj.details ?? ""),
+        instructions: String(obj.instructions ?? ""),
+        isActive: String(obj.is_active).toLowerCase() === "true",
+      };
+    });
+  }
+
+  async getActivePaymentMethods(): Promise<PaymentMethod[]> {
+    const methods = await this.getPaymentMethods();
+    return methods.filter((m) => m.isActive);
+  }
+
+  // ── Payment Proof ──
+  async submitPaymentProof(bookingId: string, proofUrl: string): Promise<Booking> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["bookings"];
+    if (!sheet) throw new Error("Bookings sheet not found");
+
+    const rows = await sheet.getRows();
+    const targetRow = rows.find((r) => r.get("id") === bookingId);
+    if (!targetRow) throw new Error(`Booking with id ${bookingId} not found`);
+
+    const now = new Date().toISOString();
+    targetRow.set("payment_proof_url", proofUrl);
+    targetRow.set("payment_status", "waiting_confirmation");
+    targetRow.set("booking_status", "waiting_payment");
+    targetRow.set("updated_at", now);
+    await targetRow.save();
+
+    return rowToBooking(targetRow.toObject());
+  }
+
+  async confirmPayment(bookingId: string, _actorId?: string): Promise<Booking> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["bookings"];
+    if (!sheet) throw new Error("Bookings sheet not found");
+
+    const rows = await sheet.getRows();
+    const targetRow = rows.find((r) => r.get("id") === bookingId);
+    if (!targetRow) throw new Error(`Booking with id ${bookingId} not found`);
+
+    const now = new Date().toISOString();
+    targetRow.set("payment_status", "paid");
+    targetRow.set("booking_status", "confirmed");
+    targetRow.set("updated_at", now);
+    await targetRow.save();
+
+    return rowToBooking(targetRow.toObject());
+  }
+
+  async rejectPayment(bookingId: string, _actorId?: string): Promise<Booking> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["bookings"];
+    if (!sheet) throw new Error("Bookings sheet not found");
+
+    const rows = await sheet.getRows();
+    const targetRow = rows.find((r) => r.get("id") === bookingId);
+    if (!targetRow) throw new Error(`Booking with id ${bookingId} not found`);
+
+    const now = new Date().toISOString();
+    targetRow.set("payment_status", "unpaid");
+    targetRow.set("booking_status", "pending");
+    targetRow.set("payment_proof_url", "");
+    targetRow.set("updated_at", now);
+    await targetRow.save();
+
+    return rowToBooking(targetRow.toObject());
+  }
+
+  async requestRefund(bookingId: string, reason?: string): Promise<Booking> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["bookings"];
+    if (!sheet) throw new Error("Bookings sheet not found");
+    const rows = await sheet.getRows();
+    const targetRow = rows.find((r) => r.get("id") === bookingId);
+    if (!targetRow) throw new Error(`Booking with id ${bookingId} not found`);
+    targetRow.set("payment_status", "refund_requested");
+    if (reason) targetRow.set("refund_reason", reason);
+    targetRow.set("updated_at", new Date().toISOString());
+    await targetRow.save();
+    return rowToBooking(targetRow.toObject());
+  }
+
+  async approveRefund(bookingId: string, _actorId?: string): Promise<Booking> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["bookings"];
+    if (!sheet) throw new Error("Bookings sheet not found");
+    const rows = await sheet.getRows();
+    const targetRow = rows.find((r) => r.get("id") === bookingId);
+    if (!targetRow) throw new Error(`Booking with id ${bookingId} not found`);
+    targetRow.set("payment_status", "refunded");
+    targetRow.set("booking_status", "cancelled");
+    targetRow.set("updated_at", new Date().toISOString());
+    await targetRow.save();
+    return rowToBooking(targetRow.toObject());
+  }
+
+  async rejectRefund(bookingId: string, _actorId?: string): Promise<Booking> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["bookings"];
+    if (!sheet) throw new Error("Bookings sheet not found");
+    const rows = await sheet.getRows();
+    const targetRow = rows.find((r) => r.get("id") === bookingId);
+    if (!targetRow) throw new Error(`Booking with id ${bookingId} not found`);
+    targetRow.set("payment_status", "paid");
+    targetRow.set("updated_at", new Date().toISOString());
+    await targetRow.save();
+    return rowToBooking(targetRow.toObject());
+  }
+
+  // ── Notifications ──
+  async getNotificationLogs(bookingId?: string): Promise<NotificationLog[]> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["notification_logs"];
+    if (!sheet) return [];
+
+    const rows = await sheet.getRows();
+    let logs = rows.map((row) => {
+      const obj = row.toObject();
+      return {
+        id: String(obj.id ?? ""),
+        type: String(obj.type ?? "") as NotificationLog["type"],
+        channel: String(obj.channel ?? "email") as NotificationLog["channel"],
+        recipient: String(obj.recipient ?? ""),
+        subject: obj.subject ? String(obj.subject) : undefined,
+        message: String(obj.message ?? ""),
+        status: String(obj.status ?? "pending") as NotificationLog["status"],
+        bookingId: obj.booking_id ? String(obj.booking_id) : undefined,
+        bookingCode: obj.booking_code ? String(obj.booking_code) : undefined,
+        errorMessage: obj.error_message ? String(obj.error_message) : undefined,
+        sentAt: obj.sent_at ? String(obj.sent_at) : undefined,
+        createdAt: String(obj.created_at ?? ""),
+        readAt: obj.read_at ? String(obj.read_at) : undefined,
+      } satisfies NotificationLog;
+    });
+
+    if (bookingId) {
+      logs = logs.filter((l) => l.bookingId === bookingId);
+    }
+    return logs;
+  }
+
+  async createNotificationLog(
+    payload: NotificationPayload,
+    status: NotificationLog["status"],
+    errorMessage?: string,
+  ): Promise<NotificationLog> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["notification_logs"];
+    if (!sheet) throw new Error("Notification logs sheet not found");
+
+    const now = new Date().toISOString();
+    const log: NotificationLog = {
+      id: `notif-${crypto.randomUUID().slice(0, 8)}`,
+      type: payload.type,
+      channel: payload.channel,
+      recipient: payload.recipient,
+      subject: payload.subject,
+      message: payload.message,
+      status,
+      bookingId: payload.bookingId,
+      bookingCode: payload.bookingCode,
+      errorMessage,
+      sentAt: status === "sent" ? now : undefined,
+      createdAt: now,
+    };
+
+    await sheet.addRow({
+      id: log.id,
+      type: log.type,
+      channel: log.channel,
+      recipient: log.recipient,
+      subject: log.subject ?? "",
+      message: log.message,
+      status: log.status,
+      booking_id: log.bookingId ?? "",
+      booking_code: log.bookingCode ?? "",
+      error_message: log.errorMessage ?? "",
+      sent_at: log.sentAt ?? "",
+      created_at: log.createdAt,
+      read_at: log.readAt ?? "",
+    });
+
+    return log;
+  }
+
+  async markNotificationRead(id: string): Promise<NotificationLog> {
+    const doc = await getSpreadsheet();
+    const sheet = doc.sheetsByTitle["notification_logs"];
+    if (!sheet) throw new Error("Notification logs sheet not found");
+
+    const rows = await sheet.getRows();
+    const targetRow = rows.find((r) => r.get("id") === id);
+    if (!targetRow) throw new Error(`Notification with id ${id} not found`);
+
+    const now = new Date().toISOString();
+    targetRow.set("status", "read");
+    targetRow.set("read_at", now);
+    await targetRow.save();
+
+    const obj = targetRow.toObject();
+    return {
+      id: String(obj.id ?? ""),
+      type: String(obj.type ?? "") as NotificationLog["type"],
+      channel: String(obj.channel ?? "email") as NotificationLog["channel"],
+      recipient: String(obj.recipient ?? ""),
+      subject: obj.subject ? String(obj.subject) : undefined,
+      message: String(obj.message ?? ""),
+      status: "read",
+      bookingId: obj.booking_id ? String(obj.booking_id) : undefined,
+      bookingCode: obj.booking_code ? String(obj.booking_code) : undefined,
+      errorMessage: obj.error_message ? String(obj.error_message) : undefined,
+      sentAt: obj.sent_at ? String(obj.sent_at) : undefined,
+      createdAt: String(obj.created_at ?? ""),
+      readAt: now,
+    };
+  }
+
+  // Auth methods - Google Sheets doesn't support auth, stubs
+  async authenticateAdmin(_email: string, _password: string): Promise<AdminUser | null> {
+    return null;
+  }
+
+  async getAdminById(_id: string): Promise<AdminUser | null> {
+    return null;
+  }
+
+  async createAdmin(data: Omit<AdminUser, "createdAt" | "lastLoginAt">): Promise<AdminUser> {
+    throw new Error("createAdmin not supported with Google Sheets adapter");
+  }
+
+  async getAllAdmins(): Promise<AdminUser[]> {
+    return [];
+  }
+
+  async registerCustomer(_data: { name: string; email: string; phone: string; passwordHash: string }): Promise<CustomerPublic> {
+    throw new Error("Customer registration not supported with Google Sheets adapter");
+  }
+
+  async authenticateCustomer(_email: string, _password: string): Promise<CustomerPublic | null> {
+    return null;
+  }
+
+  async getCustomerById(_id: string): Promise<CustomerPublic | null> {
+    return null;
+  }
+
+  async getCustomerByEmail(_email: string): Promise<import("@/lib/types/domain").Customer | null> {
+    return null;
+  }
+
+  async getLoyaltyTransactions(_customerId: string): Promise<LoyaltyTransaction[]> {
+    return [];
+  }
+
+  async addLoyaltyPoints(_customerId: string, _points: number, _bookingId: string | undefined, _description: string, _type: LoyaltyTransactionType): Promise<LoyaltyTransaction> {
+    throw new Error("Loyalty not supported with Google Sheets adapter");
+  }
+
+  async redeemLoyaltyPoints(_customerId: string, _rewardId: string, _bookingId?: string): Promise<RewardRedemption> {
+    throw new Error("Loyalty not supported with Google Sheets adapter");
+  }
+
+  async getRewards(): Promise<Reward[]> {
+    return [];
+  }
+
+  async getActiveRewards(): Promise<Reward[]> {
+    return [];
+  }
+
+  async getCustomerRedemptions(_customerId: string): Promise<RewardRedemption[]> {
+    return [];
+  }
+
+  async updateCustomerSpent(_customerId: string, _amount: number): Promise<void> {}
+
+  // Reviews (stubs — Google Sheets not supported for reviews)
+  async createReview(): Promise<never> { throw new Error("Reviews not supported with Google Sheets adapter"); }
+  async getReviewsByVenue(): Promise<never[]> { return []; }
+  async getReviewsByCourt(): Promise<never[]> { return []; }
+  async getReviewByBooking(): Promise<null> { return null; }
+  async getVenueRating(): Promise<{ avgRating: number; reviewCount: number }> { return { avgRating: 0, reviewCount: 0 }; }
+  async updateVenueRating(): Promise<void> {}
+  async updateVenueConfig(): Promise<void> {}
+
+  // Area methods
+  async getAreas(): Promise<Area[]> { return []; }
+  async getAreasBySport(_sportId: string): Promise<Area[]> { return []; }
+  async getAreaById(_id: string): Promise<Area | null> { return null; }
+
+  // Venue owner methods
+  async getVenueOwners(): Promise<VenueOwner[]> { return []; }
+  async getVenueOwnerById(_id: string): Promise<VenueOwner | null> { return null; }
+  async getVenueOwnerByAdminId(_adminId: string): Promise<VenueOwner | null> { return null; }
+  async createVenueOwner(_data: Omit<VenueOwner, "id" | "createdAt" | "updatedAt">): Promise<VenueOwner> {
+    throw new Error("Venue owners not supported with Google Sheets adapter");
+  }
+  async updateVenueOwnerStatus(_id: string, _status: VenueOwner["status"]): Promise<VenueOwner> {
+    throw new Error("Venue owners not supported with Google Sheets adapter");
+  }
+
+  // Venue approval methods
+  async updateVenueApproval(_id: string, _approvalStatus: Venue["approvalStatus"]): Promise<Venue> {
+    throw new Error("Venue approval not supported with Google Sheets adapter");
+  }
+
+  // Booking update methods
+  async updateBooking(_id: string, _updates: Partial<Booking>): Promise<Booking> {
+    throw new Error("Update booking not supported with Google Sheets adapter");
+  }
+
+  // Reviews - Moderation
+  async getPendingReviews(): Promise<never[]> { return []; }
+  async moderateReview(): Promise<never> { throw new Error("Review moderation not supported with Google Sheets adapter"); }
+
+  // Favorites
+  async getCustomerFavorites(): Promise<never[]> { return []; }
+  async addFavorite(): Promise<void> {}
+  async removeFavorite(): Promise<void> {}
+  async getFavoriteVenueIds(): Promise<never[]> { return []; }
+
+  // === Sprint 12-15 stubs (GoogleSheets not used in prod) ===
+  async getPickupGames(filters?: { sport?: string; status?: string; date?: string }): Promise<PickupGame[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async getPickupGameById(id: string): Promise<PickupGame | null> { throw new Error('Not implemented in GoogleSheets'); }
+  async createPickupGame(data: Omit<PickupGame, "id" | "createdAt" | "updatedAt" | "currentPlayers">): Promise<PickupGame> { throw new Error('Not implemented in GoogleSheets'); }
+  async updatePickupGame(id: string, data: Partial<PickupGame>): Promise<PickupGame> { throw new Error('Not implemented in GoogleSheets'); }
+  async deletePickupGame(id: string): Promise<void> { throw new Error('Not implemented in GoogleSheets'); }
+  async joinPickupGame(gameId: string, customerId: string, splitAmount: number, skillLevel?: string, position?: string): Promise<PickupGameParticipant> { throw new Error('Not implemented in GoogleSheets'); }
+  async leavePickupGame(gameId: string, customerId: string): Promise<void> { throw new Error('Not implemented in GoogleSheets'); }
+  async getPickupGameParticipants(gameId: string): Promise<PickupGameParticipant[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async getPickupGamesByCustomer(customerId: string): Promise<PickupGame[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async sendPickupGameMessage(gameId: string, senderId: string, message: string): Promise<PickupGameMessage> { throw new Error('Not implemented in GoogleSheets'); }
+  async getPickupGameMessages(gameId: string, since?: string): Promise<PickupGameMessage[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async getTeamWalletsByCustomer(customerId: string): Promise<TeamWallet[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async getTeamWalletById(id: string): Promise<TeamWallet | null> { throw new Error('Not implemented in GoogleSheets'); }
+  async createTeamWallet(data: Omit<TeamWallet, "id" | "balance" | "totalSpent" | "memberCount" | "createdAt" | "updatedAt">): Promise<TeamWallet> { throw new Error('Not implemented in GoogleSheets'); }
+  async updateTeamWallet(id: string, data: Partial<TeamWallet>): Promise<TeamWallet> { throw new Error('Not implemented in GoogleSheets'); }
+  async deleteTeamWallet(id: string): Promise<void> { throw new Error('Not implemented in GoogleSheets'); }
+  async getTeamWalletMembers(walletId: string): Promise<TeamWalletMember[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async addTeamWalletMember(walletId: string, customerId: string, role?: string): Promise<TeamWalletMember> { throw new Error('Not implemented in GoogleSheets'); }
+  async removeTeamWalletMember(walletId: string, customerId: string): Promise<void> { throw new Error('Not implemented in GoogleSheets'); }
+  async updateTeamWalletMemberRole(walletId: string, customerId: string, role: string): Promise<TeamWalletMember> { throw new Error('Not implemented in GoogleSheets'); }
+  async createTeamWalletDeposit(walletId: string, fromCustomerId: string, amount: number, paymentMethod?: string, notes?: string): Promise<TeamWalletDeposit> { throw new Error('Not implemented in GoogleSheets'); }
+  async confirmTeamWalletDeposit(depositId: string): Promise<TeamWalletDeposit> { throw new Error('Not implemented in GoogleSheets'); }
+  async getTeamWalletDeposits(walletId: string): Promise<TeamWalletDeposit[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async getTeamWalletTransactions(walletId: string): Promise<TeamWalletTransaction[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async createTeamWalletTransaction(data: Omit<TeamWalletTransaction, "id" | "createdAt">): Promise<TeamWalletTransaction> { throw new Error('Not implemented in GoogleSheets'); }
+  async payBookingFromWallet(walletId: string, bookingId: string, amount: number): Promise<TeamWalletTransaction> { throw new Error('Not implemented in GoogleSheets'); }
+  async createWalletSplit(walletId: string, bookingId: string, totalAmount: number, splitType: string, members: { customerId: string; amount: number }[]): Promise<TeamWalletSplit> { throw new Error('Not implemented in GoogleSheets'); }
+  async getWalletSplits(walletId: string): Promise<TeamWalletSplit[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async getWalletSplitMembers(splitId: string): Promise<TeamWalletSplitMember[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async getPlayerProfile(customerId: string): Promise<PlayerProfile | null> { throw new Error('Not implemented in GoogleSheets'); }
+  async upsertPlayerProfile(data: Partial<PlayerProfile> & { customerId: string }): Promise<PlayerProfile> { throw new Error('Not implemented in GoogleSheets'); }
+  async searchPlayers(filters?: { sport?: string; skillLevel?: string; location?: string }): Promise<PlayerProfile[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async createPlayerSkillRating(data: Omit<PlayerSkillRating, "id" | "createdAt">): Promise<PlayerSkillRating> { throw new Error('Not implemented in GoogleSheets'); }
+  async getPlayerSkillRatings(customerId: string): Promise<PlayerSkillRating[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async createMatchRequest(data: Omit<MatchRequest, "id" | "status" | "respondedAt" | "createdAt">): Promise<MatchRequest> { throw new Error('Not implemented in GoogleSheets'); }
+  async getMatchRequests(customerId: string): Promise<MatchRequest[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async updateMatchRequest(id: string, status: "accepted" | "declined"): Promise<MatchRequest> { throw new Error('Not implemented in GoogleSheets'); }
+  async getAchievements(): Promise<Achievement[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async getPlayerAchievements(customerId: string): Promise<(PlayerAchievement & { achievement: Achievement })[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async upsertPlayerAchievement(customerId: string, achievementId: string, progress: number): Promise<PlayerAchievement> { throw new Error('Not implemented in GoogleSheets'); }
+  async getLeaderboard(limit?: number): Promise<{ customerId: string; name: string; totalPoints: number; totalGames: number }[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async getPlayerStreaks(customerId: string): Promise<PlayerStreak[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async updatePlayerStreak(customerId: string, streakType: string): Promise<PlayerStreak> { throw new Error('Not implemented in GoogleSheets'); }
+  async getFlashDeals(filters?: { status?: string; courtId?: string }): Promise<FlashDeal[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async getFlashDealById(id: string): Promise<FlashDeal | null> { throw new Error('Not implemented in GoogleSheets'); }
+  async createFlashDeal(data: Omit<FlashDeal, "id" | "claimedBy" | "claimedAt" | "createdAt">): Promise<FlashDeal> { throw new Error('Not implemented in GoogleSheets'); }
+  async claimFlashDeal(id: string, customerId: string): Promise<FlashDeal> { throw new Error('Not implemented in GoogleSheets'); }
+  async getVenueCameras(venueId: string): Promise<VenueCamera[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async createVenueCamera(data: Omit<VenueCamera, "id" | "lastUpdated" | "createdAt">): Promise<VenueCamera> { throw new Error('Not implemented in GoogleSheets'); }
+  async updateVenueCamera(id: string, data: Partial<VenueCamera>): Promise<VenueCamera> { throw new Error('Not implemented in GoogleSheets'); }
+  async deleteVenueCamera(id: string): Promise<void> { throw new Error('Not implemented in GoogleSheets'); }
+  async getVenueVerification(venueId: string): Promise<VenueVerification | null> { throw new Error('Not implemented in GoogleSheets'); }
+  async createVenueVerification(data: Omit<VenueVerification, "id" | "overallScore" | "verifiedAt" | "createdAt">): Promise<VenueVerification> { throw new Error('Not implemented in GoogleSheets'); }
+  async updateVenueVerification(id: string, data: Partial<VenueVerification>): Promise<VenueVerification> { throw new Error('Not implemented in GoogleSheets'); }
+  async getVenueVerificationPhotos(verificationId: string): Promise<VenueVerificationPhoto[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async createVenueVerificationPhoto(data: Omit<VenueVerificationPhoto, "id" | "createdAt">): Promise<VenueVerificationPhoto> { throw new Error('Not implemented in GoogleSheets'); }
+  async getLoyaltyTiers(): Promise<LoyaltyTier[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async createGroupBooking(): Promise<GroupBooking> { throw new Error('Not implemented in GoogleSheets'); }
+  async getGroupBookingById(): Promise<GroupBooking | null> { throw new Error('Not implemented in GoogleSheets'); }
+  async getGroupBookingDetail(): Promise<GroupBookingDetail | null> { throw new Error('Not implemented in GoogleSheets'); }
+  async getGroupBookingsByOrganizer(): Promise<GroupBooking[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async updateGroupBookingStatus(): Promise<GroupBooking> { throw new Error('Not implemented in GoogleSheets'); }
+  async deleteGroupBooking(): Promise<void> { throw new Error('Not implemented in GoogleSheets'); }
+  async getGroupBookingParticipants(): Promise<GroupBookingParticipant[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async addGroupBookingParticipant(): Promise<GroupBookingParticipant> { throw new Error('Not implemented in GoogleSheets'); }
+  async getGroupBookingParticipant(): Promise<GroupBookingParticipant | null> { throw new Error('Not implemented in GoogleSheets'); }
+  async updateGroupBookingParticipantStatus(): Promise<GroupBookingParticipant> { throw new Error('Not implemented in GoogleSheets'); }
+  async getGroupBookingParticipantById(): Promise<GroupBookingParticipant | null> { throw new Error('Not implemented in GoogleSheets'); }
+  async getGroupBookingTimeSlots(): Promise<GroupBookingTimeSlot[]> { throw new Error('Not implemented in GoogleSheets'); }
+  async addGroupBookingTimeSlot(): Promise<GroupBookingTimeSlot> { throw new Error('Not implemented in GoogleSheets'); }
+  async getGroupBookingTimeSlotById(): Promise<GroupBookingTimeSlot | null> { throw new Error('Not implemented in GoogleSheets'); }
+  async voteGroupBookingTimeSlot(): Promise<GroupBookingTimeSlot> { throw new Error('Not implemented in GoogleSheets'); }
+  async markGroupBookingWinner(): Promise<GroupBookingTimeSlot> { throw new Error('Not implemented in GoogleSheets'); }
+  async getVoucherByCode(): Promise<VoucherRow | null> { throw new Error('Not implemented in GoogleSheets'); }
+  async incrementVoucherUsage(): Promise<boolean> { throw new Error('Not implemented in GoogleSheets'); }
+
+}

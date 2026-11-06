@@ -1,0 +1,112 @@
+import type { DatabaseAdapter } from "@/lib/adapters/database-adapter";
+import type { Booking, BlockedSlot } from "@/lib/types/domain";
+
+const ACTIVE_STATUSES: Booking["bookingStatus"][] = [
+  "pending",
+  "waiting_payment",
+  "waiting_verification",
+  "paid",
+  "confirmed",
+];
+
+export interface TimeSlot {
+  startTime: string;
+  endTime: string;
+  isAvailable: boolean;
+}
+
+interface AvailableSlotsInput {
+  courtId: string;
+  date: string;
+  slotDurationMinutes?: number;
+  openTime?: string;
+  closeTime?: string;
+}
+
+export class AvailabilityService {
+  constructor(private readonly adapter: DatabaseAdapter) {}
+
+  async getAvailableSlots(input: AvailableSlotsInput): Promise<TimeSlot[]> {
+    const {
+      courtId,
+      date,
+      slotDurationMinutes = 60,
+      openTime = "06:00",
+      closeTime = "23:00",
+    } = input;
+
+    const [bookings, blockedSlots] = await Promise.all([
+      this.adapter.getBookingsByCourtAndDate(courtId, date),
+      this.adapter.getBlockedSlots(courtId, date),
+    ]);
+
+    const now = new Date();
+    const activeBookings = bookings.filter((b) => {
+      if (!ACTIVE_STATUSES.includes(b.bookingStatus)) return false;
+      // Expired waiting_payment bookings don't block slots
+      if (b.bookingStatus === "waiting_payment" && b.expiresAt) {
+        if (new Date(b.expiresAt) <= now) return false;
+      }
+      return true;
+    });
+
+    const slots: TimeSlot[] = [];
+    const openMinutes = timeToMinutes(openTime);
+    const closeMinutes = timeToMinutes(closeTime);
+
+    for (let start = openMinutes; start + slotDurationMinutes <= closeMinutes; start += slotDurationMinutes) {
+      const end = start + slotDurationMinutes;
+      const startStr = minutesToTime(start);
+      const endStr = minutesToTime(end);
+
+      const isBooked = activeBookings.some(
+        (b) => b.startTime < endStr && b.endTime > startStr,
+      );
+      const isBlocked = blockedSlots.some(
+        (bs) => bs.startTime < endStr && bs.endTime > startStr,
+      );
+
+      slots.push({
+        startTime: startStr,
+        endTime: endStr,
+        isAvailable: !isBooked && !isBlocked,
+      });
+    }
+
+    return slots;
+  }
+}
+
+export function hasBookingConflict(
+  bookings: Booking[],
+  startTime: string,
+  endTime: string,
+): boolean {
+  const now = new Date();
+  return bookings.some((b) => {
+    if (!ACTIVE_STATUSES.includes(b.bookingStatus)) return false;
+    if (b.bookingStatus === "waiting_payment" && b.expiresAt && new Date(b.expiresAt) <= now) return false;
+    return b.startTime < endTime && b.endTime > startTime;
+  });
+}
+
+export function hasBlockedSlotConflict(
+  blockedSlots: BlockedSlot[],
+  startTime: string,
+  endTime: string,
+): boolean {
+  return blockedSlots.some(
+    (bs) => bs.startTime < endTime && bs.endTime > startTime,
+  );
+}
+
+function timeToMinutes(time: string): number {
+  const [h, m] = time.split(":").map(Number);
+  return h * 60 + m;
+}
+
+function minutesToTime(minutes: number): string {
+  const h = Math.floor(minutes / 60);
+  const m = minutes % 60;
+  return `${String(h).padStart(2, "0")}:${String(m).padStart(2, "0")}`;
+}

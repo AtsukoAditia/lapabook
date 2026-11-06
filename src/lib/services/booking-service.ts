@@ -1,0 +1,366 @@
+import type { CreateBookingInput, DatabaseAdapter } from "@/lib/adapters/database-adapter";
+import type { Booking, AuditLogAction } from "@/lib/types/domain";
+import { calculateDynamicPrice } from "./pricing-service";
+import { validateVoucher, consumeVoucher } from "./voucher-service";
+import { hasBlockedSlotConflict, hasBookingConflict } from "./availability-service";
+import {
+  sendBookingCreated,
+  sendBookingConfirmation,
+  sendBookingRejection,
+  sendBookingCancellation,
+  sendAdminNewBookingAlert,
+} from "./notification-service";
+
+export class BookingService {
+  constructor(private readonly adapter: DatabaseAdapter) {}
+
+  async getAllBookings(): Promise<Booking[]> {
+    return this.adapter.getBookings();
+  }
+
+  async getBookingById(id: string): Promise<Booking | null> {
+    return this.adapter.getBookingById(id);
+  }
+
+  async getBookingByCode(code: string): Promise<Booking | null> {
+    return this.adapter.getBookingByCode(code);
+  }
+
+  async getBookingsByCourtAndDate(courtId: string, date: string): Promise<Booking[]> {
+    return this.adapter.getBookingsByCourtAndDate(courtId, date);
+  }
+
+  /**
+   * Create a booking with double-booking prevention.
+   *
+   * Flow:
+   * 1. Validate time range (start < end, valid format).
+   * 2. Check for conflicts with existing bookings and blocked slots.
+   * 3. Calculate price using pricing rules.
+   * 4. Save booking (adapter layer also does a final conflict check).
+   * 5. Log audit entry for booking creation.
+   */
+  async createBooking(input: Omit<CreateBookingInput, "totalPrice" | "durationMinutes"> & {
+    durationMinutes: number;
+  }): Promise<Booking> {
+    // ── 1. Validate time range ──
+    if (!isValidTimeRange(input.startTime, input.endTime)) {
+      throw new Error("Format waktu tidak valid. Pastikan jam mulai < jam selesai.");
+    }
+
+    if (input.durationMinutes <= 0) {
+      throw new Error("Durasi booking harus lebih dari 0 menit.");
+    }
+
+    if (input.durationMinutes % 30 !== 0) {
+      throw new Error("Durasi booking harus kelipatan 30 menit.");
+    }
+
+    // ── 2. Check for conflicts (first pass — fast rejection) ──
+    await this.adapter.expireBookings();
+    const [existingBookings, blockedSlots, pricingRules, courts] = await Promise.all([
+      this.adapter.getBookingsByCourtAndDate(input.courtId, input.bookingDate),
+      this.adapter.getBlockedSlots(input.courtId, input.bookingDate),
+      this.adapter.getPricingRules(input.courtId),
+      this.adapter.getCourts(),
+    ]);
+
+    const bookingConflict = hasBookingConflict(existingBookings, input.startTime, input.endTime);
+    const blockedConflict = hasBlockedSlotConflict(blockedSlots, input.startTime, input.endTime);
+
+    if (bookingConflict || blockedConflict) {
+      throw new Error("CONFLICT: Slot sudah dipesan atau diblokir. Silakan pilih jam lain.");
+    }
+
+    // ── 3. Calculate price ──
+    const courtData = courts.find((c) => c.id === input.courtId);
+    if (!courtData) {
+      throw new Error("Lapangan tidak ditemukan.");
+    }
+
+    const basePrice = courtData.basePrice ?? 0;
+    const baseTotalPrice = await calculateDynamicPrice({
+      durationMinutes: input.durationMinutes,
+      basePrice,
+      pricingRules,
+      bookingDate: input.bookingDate,
+      startTime: input.startTime,
+      courtId: input.courtId,
+      adapter: this.adapter,
+    }, this.adapter);
+
+    // ── 3b. Voucher (optional) ──
+    // Server-side re-validation, then atomic quota consumption. If the quota
+    // race is lost, the booking is rejected rather than silently over-redeeming.
+    let voucherDiscount = 0;
+    let appliedVoucherCode: string | undefined;
+    if (input.voucherCode) {
+      const redeem = await validateVoucher(input.voucherCode, baseTotalPrice);
+      if (!redeem.valid) {
+        throw new Error(redeem.error);
+      }
+      const consumed = await consumeVoucher(redeem.code);
+      if (!consumed) {
+        throw new Error("Kuota voucher baru saja habis. Silakan lanjut tanpa voucher.");
+      }
+      voucherDiscount = redeem.discountAmount;
+      appliedVoucherCode = redeem.code;
+    }
+
+    // Generate unique 3-digit code for transfer identification
+    const uniqueCode = generateUniqueCode();
+    const totalPrice = Math.max(0, baseTotalPrice - voucherDiscount) + uniqueCode;
+
+    // ── 4. Re-check conflicts right before save (double-booking prevention) ──
+    // This prevents race conditions where two requests pass step 2 simultaneously.
+    const freshBookings = await this.adapter.getBookingsByCourtAndDate(
+      input.courtId,
+      input.bookingDate,
+    );
+    const freshConflict = hasBookingConflict(freshBookings, input.startTime, input.endTime);
+    if (freshConflict) {
+      throw new Error("CONFLICT: Slot baru saja dipesan oleh pengguna lain. Silakan pilih jam lain.");
+    }
+
+    const booking = await this.adapter.createBooking({
+      ...input,
+      totalPrice,
+      voucherCode: appliedVoucherCode,
+    });
+
+    // ── 5. Audit log ──
+    await this.logAudit("booking_created", booking.id, "customer", undefined,
+      `Booking ${booking.bookingCode} created: ${input.bookingDate} ${input.startTime}-${input.endTime}`
+    );
+
+    // ── 6. Send notifications (non-blocking) ──
+    try {
+      await sendBookingCreated(booking);
+      await sendAdminNewBookingAlert(booking);
+    } catch {
+      console.error("[BookingService] Notification failed for booking creation");
+    }
+
+    return booking;
+  }
+
+  /**
+   * Submit payment proof by internal booking ID.
+   *
+   * This method is retained for admin/internal compatibility only. Public APIs
+   * should prefer submitPaymentProofByCode() so clients do not rely on internal IDs.
+   */
+  async submitPaymentProof(bookingId: string, proofUrl: string): Promise<Booking> {
+    const booking = await this.getBookingOrThrow(bookingId);
+
+    this.assertCanSubmitPaymentProof(booking);
+
+    const result = await this.adapter.submitPaymentProof(bookingId, proofUrl);
+
+    await this.logAudit("payment_proof_submitted", bookingId, "customer", undefined,
+      `Payment proof submitted for ${booking.bookingCode}`
+    );
+
+    return result;
+  }
+
+  /**
+   * Submit payment proof by public booking code.
+   *
+   * Phone verification is supported now and should become mandatory before
+   * production. It is optional during the current MVP so the existing success
+   * page can keep working while the UI is updated.
+   */
+  async submitPaymentProofByCode(input: {
+    bookingCode: string;
+    phone?: string;
+    proofUrl: string;
+    isSettlement?: boolean;
+  }): Promise<Booking> {
+    const booking = await this.adapter.getBookingByCode(input.bookingCode);
+
+    if (!booking) {
+      throw new Error(`Booking dengan kode ${input.bookingCode} tidak ditemukan.`);
+    }
+
+    if (
+      input.phone &&
+      normalizePhone(input.phone) !== normalizePhone(booking.customerPhone)
+    ) {
+      throw new Error("Nomor telepon tidak sesuai dengan data booking.");
+    }
+
+    this.assertCanSubmitPaymentProof(booking, input.isSettlement);
+
+    const result = await this.adapter.submitPaymentProof(booking.id, input.proofUrl);
+
+    await this.logAudit("payment_proof_submitted", booking.id, "customer", undefined,
+      `Payment proof submitted for ${booking.bookingCode}`
+    );
+
+    return result;
+  }
+
+  /**
+   * Admin confirms payment. Sets booking_status=confirmed, payment_status=paid.
+   */
+  async confirmBooking(id: string, actorId?: string): Promise<Booking> {
+    const booking = await this.getBookingOrThrow(id);
+    const result = await this.adapter.confirmPayment(id, actorId);
+    await this.logAudit("booking_confirmed", id, "admin", actorId,
+      `Booking ${booking.bookingCode} confirmed`,
+      booking.bookingStatus, "confirmed"
+    );
+    try { await sendBookingConfirmation(result); } catch { /* non-blocking */ }
+
+    // Award loyalty points via LoyaltyService (idempotent)
+    if (booking.userId) {
+      try {
+        const { LoyaltyService } = await import("./loyalty-service");
+        const loyalty = new LoyaltyService(this.adapter);
+        await loyalty.awardBookingPoints(booking.userId, booking.id, booking.totalPrice, booking.bookingCode);
+      } catch {
+        console.error(`[Loyalty] Failed to award points for booking ${booking.bookingCode}`);
+      }
+    }
+
+    return result;
+  }
+
+  /**
+   * Admin rejects payment. Sets booking_status=cancelled, payment_status=unpaid.
+   * Frees the slot for other customers.
+   */
+  async rejectBooking(id: string, actorId?: string): Promise<Booking> {
+    const booking = await this.getBookingOrThrow(id);
+    const result = await this.adapter.rejectPayment(id, actorId);
+    await this.logAudit("booking_rejected", id, "admin", actorId,
+      `Booking ${booking.bookingCode} rejected`,
+      booking.bookingStatus, "rejected"
+    );
+    try { await sendBookingRejection(result); } catch { /* non-blocking */ }
+    return result;
+  }
+
+  /**
+   * Expire bookings that have passed their expiry time.
+   * Returns number of expired bookings.
+   */
+  async expireBookings(): Promise<number> {
+    const count = await this.adapter.expireBookings();
+    if (count > 0) {
+      console.log(`[BookingService] Expired ${count} bookings`);
+    }
+    return count;
+  }
+
+  async cancelBooking(id: string, actorId?: string): Promise<Booking> {
+    const booking = await this.getBookingOrThrow(id);
+    const result = await this.adapter.updateBookingStatus(id, "cancelled");
+    await this.logAudit("booking_status_changed", id, "admin", actorId,
+      `Booking ${booking.bookingCode} cancelled`,
+      booking.bookingStatus, "cancelled"
+    );
+    try { await sendBookingCancellation(result); } catch { /* non-blocking */ }
+    return result;
+  }
+
+  async completeBooking(id: string, actorId?: string): Promise<Booking> {
+    const booking = await this.getBookingOrThrow(id);
+    const result = await this.adapter.updateBookingStatus(id, "completed");
+    await this.logAudit("booking_status_changed", id, "admin", actorId,
+      `Booking ${booking.bookingCode} completed`,
+      booking.bookingStatus, "completed"
+    );
+    return result;
+  }
+
+  async markNoShow(id: string, actorId?: string): Promise<Booking> {
+    const booking = await this.getBookingOrThrow(id);
+    const result = await this.adapter.updateBookingStatus(id, "no_show");
+    await this.logAudit("booking_status_changed", id, "admin", actorId,
+      `Booking ${booking.bookingCode} marked as no_show`,
+      booking.bookingStatus, "no_show"
+    );
+    return result;
+  }
+
+  // ── Private helpers ──
+
+  private async getBookingOrThrow(id: string): Promise<Booking> {
+    const booking = await this.adapter.getBookingById(id);
+    if (!booking) {
+      throw new Error(`Booking dengan ID ${id} tidak ditemukan.`);
+    }
+    return booking;
+  }
+
+  private assertCanSubmitPaymentProof(booking: Booking, isSettlement?: boolean): void {
+    // Pelunasan: hanya untuk booking DP yang sudah dikonfirmasi sebagian.
+    if (isSettlement) {
+      if (booking.bookingStatus !== "confirmed" || booking.paymentStatus !== "dp_paid") {
+        throw new Error("Pelunasan hanya untuk booking DP yang sudah terverifikasi sebagian.");
+      }
+      return;
+    }
+    if (booking.bookingStatus !== "waiting_payment") {
+      throw new Error(`Booking dalam status ${booking.bookingStatus}, tidak bisa upload bukti bayar.`);
+    }
+
+    if (booking.expiresAt && new Date(booking.expiresAt).getTime() <= Date.now()) {
+      throw new Error("Booking sudah kadaluarsa. Silakan buat booking baru.");
+    }
+  }
+
+  private async logAudit(
+    action: AuditLogAction,
+    targetId: string,
+    actorType: "customer" | "admin" | "system",
+    actorId?: string,
+    details?: string,
+    previousValue?: string,
+    newValue?: string,
+  ): Promise<void> {
+    try {
+      await this.adapter.createAuditLog({
+        action,
+        targetType: "booking",
+        targetId,
+        actorType,
+        actorId,
+        details: details ?? "",
+        previousValue,
+        newValue,
+      });
+    } catch {
+      // Audit logging should never break booking flow
+      console.error(`[AuditLog] Failed to log action=${action} target=${targetId}`);
+    }
+  }
+}
+
+// ── Utility functions ──
+
+function isValidTimeRange(startTime: string, endTime: string): boolean {
+  const timeRegex = /^([01]\d|2[0-3]):([0-5]\d)$/;
+  if (!timeRegex.test(startTime) || !timeRegex.test(endTime)) return false;
+
+  const [sh, sm] = startTime.split(":").map(Number);
+  const [eh, em] = endTime.split(":").map(Number);
+  const startMinutes = sh * 60 + sm;
+  const endMinutes = eh * 60 + em;
+
+  return endMinutes > startMinutes;
+}
+
+function normalizePhone(value: string): string {
+  return value.replace(/\D/g, "").replace(/^62/, "0");
+}
+
+/**
+ * Generate unique 3-digit code (100-999) for transfer identification.
+ * This makes each payment amount unique so admin can easily match transfers to bookings.
+ */
+function generateUniqueCode(): number {
+  return Math.floor(Math.random() * 900) + 100;
+}
